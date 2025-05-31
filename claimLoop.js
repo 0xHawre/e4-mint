@@ -1,59 +1,72 @@
 require("dotenv").config();
 const { ethers } = require("ethers");
 
-const RPC_URL = process.env.RPC_URL;
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
+const RPC_URL        = process.env.RPC_URL;
+const PRIVATE_KEY    = process.env.PRIVATE_KEY;
+const CONTRACT_ADDR  = process.env.CONTRACT_ADDRESS;
 
-const provider = new ethers.JsonRpcProvider(RPC_URL);
-const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+// How often to print a log line (e.g. every 1000 TXs)
+const LOG_INTERVAL = 1000;
 
-const CLAIM_FUNCTION_SELECTOR = "0x05632f40";
-const GAS_LIMIT = 100000;
-const TX_BATCH_SIZE = 5; // Kirim 10 tx sekaligus per batch
-const INTERVAL_MS = 1; // Delay antar batch
+(async () => {
+  const provider = new ethers.JsonRpcProvider(RPC_URL);
+  const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
 
-let counter = 0;
-let successCounter = 0;
-
-async function claimLoop() {
-  let baseNonce = await provider.getTransactionCount(wallet.address, "latest");
-
-  console.log("🚀 Claim loop started");
+  // Fetch the starting nonce once
+  let currentNonce = await provider.getTransactionCount(wallet.address, "latest");
+  console.log("Starting claim loop at nonce", currentNonce);
   console.log("Wallet:", wallet.address);
-  console.log("Starting nonce:", baseNonce);
 
-  setInterval(() => {
-    console.log(`📊 TX sent: ${counter}, Successful: ${successCounter} [${new Date().toLocaleTimeString()}]`);
-  }, 10 * 60 * 1000); // setiap 10 menit
+  let counter = 0;
 
   while (true) {
-    const promises = [];
+    try {
+      // Build the transaction object (no await here)
+      const txRequest = {
+        to:       CONTRACT_ADDR,
+        data:     "0x05632f40",    // function selector for claim()
+        gasLimit: 100_000,          // adjust if needed
+        nonce:    currentNonce
+      };
 
-    for (let i = 0; i < TX_BATCH_SIZE; i++) {
-      const nonce = baseNonce + counter;
+      // 1) Locally sign the transaction (very fast)
+      const signedTxPromise = wallet.signTransaction(txRequest);
 
-      const txPromise = wallet.sendTransaction({
-        to: CONTRACT_ADDRESS,
-        data: CLAIM_FUNCTION_SELECTOR,
-        gasLimit: GAS_LIMIT,
-        nonce
-      })
-      .then(tx => {
-        successCounter++;
-        console.log(`[${counter}] ✅ Sent: ${tx.hash}`);
-      })
-      .catch(err => {
-        console.error(`[${counter}] ❌ Error:`, err?.reason || err?.message || err);
-      });
+      // 2) Immediately increment local nonce
+      currentNonce++;
 
-      promises.push(txPromise);
+      // 3) When signing is done, send raw
+      signedTxPromise
+        .then((signedTx) => {
+          // fire-and-forget: we do NOT await this
+          provider.sendRawTransaction(signedTx).catch((err) => {
+            // If the node rejects it, log it once
+            console.error(
+              `[sendRaw] ❌ TX at nonce ${txRequest.nonce} rejected:`,
+              err.reason || err.message || err
+            );
+          });
+        })
+        .catch((signErr) => {
+          console.error(
+            `[signing] ❌ Failed to sign TX at nonce ${txRequest.nonce}:`,
+            signErr.message || signErr
+          );
+        });
+
       counter++;
+      if (counter % LOG_INTERVAL === 0) {
+        console.log(`[${counter.toLocaleString()}] Dispatched TX at nonce ${txRequest.nonce}`);
+      }
+
+      // No manual delay; loop continues as fast as CPU can sign
+      // If your machine is too fast, you may start lining up thousands of
+      // pending TXs in the mempool. Monitor your node’s health!
+
+    } catch (err) {
+      // This catch will only fire if something in the synchronous part throws.
+      console.error(`[loop] Unexpected error at iteration ${counter}:`, err);
+      // Do NOT increment nonce here because nothing was sent/signed.
     }
-
-    await Promise.all(promises);
-    await new Promise((res) => setTimeout(res, INTERVAL_MS));
   }
-}
-
-claimLoop();
+})();
